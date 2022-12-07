@@ -1,0 +1,155 @@
+on:
+  workflow_call:
+    inputs:
+      dryrun:
+        type: boolean
+        default: false
+      additional-checkout-title:
+        type: string
+      additional-checkout-path:
+        type: string
+      env:
+        required: true
+        type: string
+      aws-region:
+        type: string
+        default: 'us-east-2'
+      container-repo:
+        required: true
+        type: string
+      vars-file-path:
+        required: true
+        type: string
+      secrets-file-path:
+        required: true
+        type: string
+      task-def-path:
+        required: true
+        type: string
+      main-container-name:
+        type: string
+        default: 'main'
+      ecs-cluster:
+        required: true
+        type: string
+      ecs-service:
+        required: true
+        type: string
+      wait-for-service-stability:
+        type: boolean
+        default: true
+
+    secrets:
+      additional-checkout-repo-ssh-key:
+        required: false
+      aws-access-key-id:
+        required: true
+      aws-secret-access-key:
+        required: true
+
+jobs:
+  build-and-deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install python3-tomli
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Additional checkout ${{ inputs.additional-checkout-title }}
+        if: inputs.additional-checkout-title != ''
+        uses: actions/checkout@v3
+        with:
+          repository: TRANSFR-Inc/Common
+          path: ${{ inputs.additional-checkout-path }}
+          ssh-key: ${{ secrets.additional-checkout-repo-ssh-key }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@0b60d8cf355d223708a11c0d5770ec8245884767
+        with:
+          aws-access-key-id: ${{ secrets.aws-access-key-id }}
+          aws-secret-access-key: ${{ secrets.aws-secret-access-key }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to container registry
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@04076d0c84e7c15827a7474c4ddab86b66cdd8a7
+
+      - name: Build and push
+        id: build-image
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ inputs.container-repo }}:${{ github.sha }}
+
+      - name: Fill in env vars in the ECS task definition
+        run: |
+          CONF_TOML_FILE="${{ inputs.vars-file-path }}"
+          ORIGINAL_TASK_DEF_FILE="${{ inputs.task-def-path }}"
+          TEMP_FILE=$(mktemp /tmp/XXXXXX.env)
+          NEW_TASK_DEF_FILE=$(mktemp /tmp/XXXXXX.env)
+
+          # Convert TOML to JSON
+          python3 -c "import json, sys, tomli; json.dump(tomli.load(open('$CONF_TOML_FILE', 'rb')), sys.stdout, indent=2)" > $TEMP_FILE
+
+          # Convert to format required for task definition
+          CONF_JSON_DATA="$(jq 'to_entries | [ .[] | .["name"] = .key | del(.key) ]' < $TEMP_FILE)"
+
+          # Combine
+          jq --argjson data "$CONF_JSON_DATA" '.containerDefinitions[0].environment = $data' $ORIGINAL_TASK_DEF_FILE > $NEW_TASK_DEF_FILE
+
+          # Overwrite
+          mv $NEW_TASK_DEF_FILE $ORIGINAL_TASK_DEF_FILE
+
+      - name: Fill in secrets in the ECS task definition
+        run: |
+          SECRETS_TOML_FILE="${{ inputs.secrets-file-path }}"
+          ORIGINAL_TASK_DEF_FILE="${{ inputs.task-def-path }}"
+          TMP_FILE=$(mktemp /tmp/XXXXXX.env)
+          NEW_TASK_DEF_FILE=$(mktemp /tmp/XXXXXX.env)
+
+          # Convert TOML to JSON
+          python3 -c "import json, sys, tomli; json.dump(tomli.load(open('$SECRETS_TOML_FILE', 'rb')), sys.stdout, indent=2)" > $TMP_FILE
+
+          # Convert to format required for task definition
+          SECRETS_JSON_DATA="$(jq 'to_entries | [ .[] | .["name"] = .key | .["valueFrom"] = .value | del(.key, .value) ]' < $TMP_FILE)"
+          
+          # Combine
+          jq --argjson data "$SECRETS_JSON_DATA" '.containerDefinitions[0].secrets = $data' $ORIGINAL_TASK_DEF_FILE > $NEW_TASK_DEF_FILE
+          
+          # Overwrite
+          mv $NEW_TASK_DEF_FILE $ORIGINAL_TASK_DEF_FILE
+
+      - name: Fill in the new image ID in the ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@f15ed65f9cc12455139db0f8e8ff6f6aaad6dfda
+        with:
+          task-definition: ${{ inputs.task-def-path }}
+          container-name: ${{ inputs.main-container-name }}
+          image: ${{ inputs.container-repo }}:${{ github.sha }}
+      
+      - name: Debug
+        if: inputs.dryrun
+        run: |
+          cat ${{ steps.task-def.outputs.task-definition }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@cddd3e5e56c1db3702e801f72a7296f183755334
+        if: ${{ !inputs.dryrun }}
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ inputs.ecs-service }}
+          cluster: ${{ inputs.ecs-cluster }}
+          wait-for-service-stability: ${{ inputs.wait-for-service-stability }}
